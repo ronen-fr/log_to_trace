@@ -139,20 +139,21 @@ def resolve_canonical_state(partial_state: str) -> Optional[str]:
 
     # Try to find a canonical state that ends with this partial state
     for canonical in CANONICAL_STATES:
-        if canonical.endswith('/' + translated) or canonical == translated:
+        if canonical.endswith('/' + translated):
             return canonical
 
-    # If partial state has multiple components, try matching from the end
-    for canonical in CANONICAL_STATES:
-        canonical_parts = canonical.split('/')
-        translated_parts = translated.split('/')
-
-        if len(translated_parts) <= len(canonical_parts):
-            # Check if translated_parts match the end of canonical_parts
-            if canonical_parts[-len(translated_parts):] == translated_parts:
-                return canonical
-
     return None
+
+#     # If partial state has multiple components, try matching from the end
+#     for canonical in CANONICAL_STATES:
+#         canonical_parts = canonical.split('/')
+#         translated_parts = translated.split('/')
+# 
+#         if len(translated_parts) <= len(canonical_parts):
+#             # Check if translated_parts match the end of canonical_parts
+#             if canonical_parts[-len(translated_parts):] == translated_parts:
+#                 return canonical
+
 
 
 def is_substate_of(state: str, potential_parent: str) -> bool:
@@ -214,8 +215,10 @@ class LogParser:
         # Extract the original timestamp (first token of the line) if present
         orig_ts = None
         parts = line.split()
-        if parts:
-            orig_ts = parts[0]
+        if not parts:
+            return None
+
+        orig_ts = parts[0]
 
         # Extract PG ID
         pg_match = self.PG_ID_PATTERN.search(line)
