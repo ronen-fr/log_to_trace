@@ -144,17 +144,6 @@ def resolve_canonical_state(partial_state: str) -> Optional[str]:
 
     return None
 
-#     # If partial state has multiple components, try matching from the end
-#     for canonical in CANONICAL_STATES:
-#         canonical_parts = canonical.split('/')
-#         translated_parts = translated.split('/')
-# 
-#         if len(translated_parts) <= len(canonical_parts):
-#             # Check if translated_parts match the end of canonical_parts
-#             if canonical_parts[-len(translated_parts):] == translated_parts:
-#                 return canonical
-
-
 
 def is_substate_of(state: str, potential_parent: str) -> bool:
     """Check if state is a direct sub-state of potential_parent."""
@@ -348,8 +337,30 @@ class TraceBuilder:
             primary_osd = f"osd.{act[0]}"
             primary_key = (pg_id, primary_osd)
 
-            # Prefer open primary span
+            # Prefer linking to the last PrimaryActive/Session span for the primary OSD
             primary_stack = self.span_stacks.get(primary_key)
+            if primary_stack:
+                for entry in reversed(primary_stack):
+                    if entry.span.state_name == "PrimaryActive/Session":
+                        primary_span = entry.span
+                        self.logger.debug(
+                            f"Linking to open primary session span {primary_span.span_id}"
+                        )
+                        return primary_span.span_id, primary_span.trace_id
+
+            primary_osd_id = primary_osd.split(".")[-1]
+            for span in reversed(self.completed_spans):
+                if (
+                    span.state_name == "PrimaryActive/Session"
+                    and span.attributes.get("role") == "primary"
+                    and span.attributes.get("osd.source") == primary_osd_id
+                ):
+                    self.logger.debug(
+                        f"Linking to closed primary session span {span.span_id}"
+                    )
+                    return span.span_id, span.trace_id
+
+            # Prefer open primary span
             if primary_stack:
                 primary_span = primary_stack[-1].span
                 self.logger.debug(f"Linking to open primary span {primary_span.span_id}")
@@ -573,6 +584,7 @@ class TraceBuilder:
         source_osd = data['source_osd']
         act_set = data['act_set']
         line_ts = data.get('orig_ts')
+        # the_session = s_new == "PrimaryActive/Session"
 
         # Update context
         self._update_context(pg_id, act_set, line_ts)
