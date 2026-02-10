@@ -35,13 +35,13 @@ CANONICAL_STATES = [
     "PrimaryActive/Session/ActiveScrubbing",
     "PrimaryActive/Session/ActiveScrubbing/PendingTimer",
     "PrimaryActive/Session/ActiveScrubbing/RangeBlocked",
-    "PrimaryActive/Session/ActiveScrubbing/NewChunk",
-    "PrimaryActive/Session/ActiveScrubbing/WaitPushes",
-    "PrimaryActive/Session/ActiveScrubbing/WaitLastUpdate",
-    "PrimaryActive/Session/ActiveScrubbing/BuildMap",
-    "PrimaryActive/Session/ActiveScrubbing/DrainReplMaps",
-    "PrimaryActive/Session/ActiveScrubbing/WaitReplicas",
-    "PrimaryActive/Session/ActiveScrubbing/WaitDigestUpdate",
+    "PrimaryActive/Session/ActiveScrubbing/in-chunk/NewChunk",
+    "PrimaryActive/Session/ActiveScrubbing/in-chunk/WaitPushes",
+    "PrimaryActive/Session/ActiveScrubbing/in-chunk/WaitLastUpdate",
+    "PrimaryActive/Session/ActiveScrubbing/in-chunk/BuildMap",
+    "PrimaryActive/Session/ActiveScrubbing/in-chunk/DrainReplMaps",
+    "PrimaryActive/Session/ActiveScrubbing/in-chunk/WaitReplicas",
+    "PrimaryActive/Session/ActiveScrubbing/in-chunk/WaitDigestUpdate",
     "ReplicaActive",
     "ReplicaActive/ReplicaIdle",
     "ReplicaActive/ReplicaActiveOp",
@@ -125,7 +125,7 @@ def translate_state_name(state_name: str) -> str:
     return '/'.join(translated)
 
 
-def resolve_canonical_state(partial_state: str) -> Optional[str]:
+def resolve_canonical_state_v0(partial_state: str) -> Optional[str]:
     """
     Resolve a possibly partial state name to its canonical form.
     The partial state may be a postfix of a canonical state.
@@ -144,6 +144,35 @@ def resolve_canonical_state(partial_state: str) -> Optional[str]:
 
     return None
 
+def resolve_canonical_state(partial_state: str) -> Optional[str]:
+    """
+    Resolve a possibly partial state name to its canonical form.
+    The partial state may be a postfix of a canonical state.
+    Special handling:
+      - treat 'Act' as 'ActiveScrubbing';
+      - manually add 'in-chunk' as a parent state for all 'ActiveScrubbing' sub-states that handle a specific chunk
+        (all sub-states but 'Blocked' and 'PendingTimer') to allow better grouping of chunk processing spans under a common parent span.
+    """
+    # First translate 'Act' to 'ActiveScrubbing'
+    translated = translate_state_name(partial_state)
+
+    # if translated.startswith("PrimaryActive/Session/ActiveScrubbing/") and not translated.endswith(("RangeBlocked", "PendingTimer")):
+    #     # Insert 'in-chunk' after 'ActiveScrubbing'
+    #     translated = translated.replace("PrimaryActive/Session/ActiveScrubbing/", "PrimaryActive/Session/ActiveScrubbing/in-chunk/")
+    if "ActiveScrubbing/" in translated and not translated.endswith(("RangeBlocked", "PendingTimer")):
+        # Insert 'in-chunk' after 'ActiveScrubbing'
+        translated = translated.replace("ActiveScrubbing/", "ActiveScrubbing/in-chunk/")
+
+    # Check if it's already a canonical state
+    if translated in CANONICAL_STATES:
+        return translated
+
+    # Try to find a canonical state that ends with this partial state
+    for canonical in CANONICAL_STATES:
+        if canonical.endswith('/' + translated):
+            return canonical
+
+    return None
 
 def is_substate_of(state: str, potential_parent: str) -> bool:
     """Check if state is a direct sub-state of potential_parent."""
