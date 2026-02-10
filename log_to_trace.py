@@ -270,7 +270,7 @@ class TraceBuilder:
     - Replica spans (ReplicaActive/ReplicaActiveOp) link to primary spans via FOLLOWS_FROM
     """
 
-    def __init__(self, debug: bool = False):
+    def __init__(self, debug: bool = False, fixed: bool = False):
         # trace_id per normalized PG ID
         self.trace_ids: Dict[str, str] = {}
         # Last seen act-set per normalized PG ID
@@ -298,16 +298,37 @@ class TraceBuilder:
             logging.basicConfig(level=logging.INFO)
             self.logger.setLevel(logging.INFO)
 
+        # Fixed/sequential ID mode (for deterministic debugging)
+        self.fixed = fixed
+        self._fixed_trace_counter = 0
+        self._fixed_span_counter = 0
+        if self.fixed:
+            self.logger.debug("Fixed ID mode enabled: generating sequential IDs starting at 1")
+
     def get_trace_id(self, pg_id: str) -> str:
         """Get or create a trace ID for a PG ID."""
         if pg_id not in self.trace_ids:
-            self.trace_ids[pg_id] = generate_trace_id()
+            self.trace_ids[pg_id] = self._gen_trace_id()
         return self.trace_ids[pg_id]
 
     def new_trace_id(self, pg_id: str) -> str:
         """Create a new trace ID for a PG ID."""
-        self.trace_ids[pg_id] = generate_trace_id()
+        self.trace_ids[pg_id] = self._gen_trace_id()
         return self.trace_ids[pg_id]
+
+    def _gen_trace_id(self) -> str:
+        """Generate a trace ID, sequential when fixed mode is enabled."""
+        if self.fixed:
+            self._fixed_trace_counter += 1
+            return str(self._fixed_trace_counter)
+        return generate_trace_id()
+
+    def _gen_span_id(self) -> str:
+        """Generate a span ID, sequential when fixed mode is enabled."""
+        if self.fixed:
+            self._fixed_span_counter += 1
+            return str(self._fixed_span_counter)
+        return generate_span_id()
 
     def _determine_role(self, source_osd: str, act_set: Optional[List[int]], state: str) -> str:
         """Determine if the source OSD is primary or replica."""
@@ -385,7 +406,7 @@ class TraceBuilder:
 
         span = Span(
             trace_id=trace_id,
-            span_id=generate_span_id(),
+            span_id=self._gen_span_id(),
             parent_span_id=parent_span_id,
             name=span_name,
             state_name=state,
@@ -710,18 +731,20 @@ class Arguments:
     input_files: List[str]
     output_file: Optional[str]
     debug: bool
+    fixed: bool = False
 
 
 def parse_arguments() -> Arguments:
     """Parse command line arguments."""
     if len(sys.argv) < 2:
-        print("Usage: python3 log_to_trace.py <input-log-file>... [--out=output.json] [--debug]", file=sys.stderr)
+        print("Usage: python3 log_to_trace.py <input-log-file>... [--out=output.json] [--debug] [--fixed]", file=sys.stderr)
         sys.exit(1)
 
     args = sys.argv[1:]
     input_files: List[str] = []
     output_file: Optional[str] = None
     debug = False
+    fixed = False
 
     i = 0
     while i < len(args):
@@ -736,12 +759,17 @@ def parse_arguments() -> Arguments:
             i += 1
         elif a in ('--debug', '-d'):
             debug = True
+        elif a.startswith('--fixed='):
+            val = a.split('=', 1)[1].lower()
+            fixed = val in ('1', 'true', 'yes', 'y')
+        elif a == '--fixed':
+            fixed = True
         else:
             input_files.append(a)
         i += 1
 
     if not input_files:
-        print("Usage: python3 log_to_trace.py <input-log-file>... [--out=output.json] [--debug]", file=sys.stderr)
+        print("Usage: python3 log_to_trace.py <input-log-file>... [--out=output.json] [--debug] [--fixed]", file=sys.stderr)
         sys.exit(1)
 
     # If no --out specified, create a temporary output file
@@ -751,7 +779,7 @@ def parse_arguments() -> Arguments:
         tmpf.close()
         print(f"No --out specified. Writing traces to temporary file {output_file}", file=sys.stderr)
 
-    return Arguments(input_files=input_files, output_file=output_file, debug=debug)
+    return Arguments(input_files=input_files, output_file=output_file, debug=debug, fixed=fixed)
 
 
 def prepare_input_files(input_files: List[str]) -> List[str]:
@@ -836,7 +864,7 @@ def main():
 
     # Parse and build traces
     parser = LogParser()
-    builder = TraceBuilder(debug=args.debug)
+    builder = TraceBuilder(debug=args.debug, fixed=args.fixed)
     process_sorted_logs(tmp_files, parser, builder)
 
     # Output results
