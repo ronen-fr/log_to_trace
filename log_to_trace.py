@@ -801,6 +801,10 @@ def parse_arguments() -> Arguments:
         print("Usage: python3 log_to_trace.py <input-log-file>... [--out=output.json] [--debug] [--fixed]", file=sys.stderr)
         sys.exit(1)
 
+    # If an --out was specified and doesn't end with .json, append .json
+    if output_file is not None and not output_file.endswith('.json'):
+        output_file = output_file + '.json'
+
     # If no --out specified, create a temporary output file
     if output_file is None:
         tmpf = tempfile.NamedTemporaryFile(prefix='log_to_trace-', suffix='.json', dir='/tmp', delete=False)
