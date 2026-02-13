@@ -51,6 +51,8 @@ CANONICAL_STATES = [
 
 # States that trigger trace reset and don't create spans
 RESET_STATES = {"NotActive", "PrimaryActive/PrimaryIdle", "ReplicaActive", "ReplicaActive/ReplicaIdle"}
+# the subset of RESET_STATES that are primary states (used to determine when to start new traces)
+PRIMARY_RESET_STATES = {"NotActive", "PrimaryActive/PrimaryIdle"}
 
 
 @dataclass
@@ -532,7 +534,7 @@ class TraceBuilder:
         self.close_all_spans(key, end_time_iso=line_ts)
         self.prev_states[key] = s_new
 
-        if prev_state in RESET_STATES or prev_state is None:
+        if prev_state in PRIMARY_RESET_STATES or prev_state is None:
             self.new_trace_id(pg_id)
 
         return True
