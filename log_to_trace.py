@@ -298,7 +298,7 @@ class TraceBuilder:
     - These close all spans and start new traces
 
     Linking:
-    - Replica spans (ReplicaActive/ReplicaActiveOp) link to primary spans via FOLLOWS_FROM
+    - Replica spans (ReplicaActive/ReplicaActiveOp) link to the latest primary NewChunk span via FOLLOWS_FROM
     """
 
     def __init__(self, debug: bool = False, fixed: bool = False):
@@ -389,26 +389,27 @@ class TraceBuilder:
             primary_osd = f"osd.{act[0]}"
             primary_key = (pg_id, primary_osd)
 
-            # Prefer linking to the last PrimaryActive/Session span for the primary OSD
+            # Prefer linking to the latest NewChunk span for the primary OSD
+            _NEW_CHUNK = "PrimaryActive/Session/ActiveScrubbing/in-chunk/NewChunk"
             primary_stack = self.span_stacks.get(primary_key)
             if primary_stack:
                 for entry in reversed(primary_stack):
-                    if entry.span.state_name == "PrimaryActive/Session":
+                    if entry.span.state_name == _NEW_CHUNK:
                         primary_span = entry.span
                         self.logger.debug(
-                            f"Linking to open primary session span {primary_span.span_id}"
+                            f"Linking to open primary NewChunk span {primary_span.span_id}"
                         )
                         return primary_span.span_id, primary_span.trace_id
 
             primary_osd_id = primary_osd.split(".")[-1]
             for span in reversed(self.completed_spans):
                 if (
-                    span.state_name == "PrimaryActive/Session"
+                    span.state_name == _NEW_CHUNK
                     and span.attributes.get("role") == "primary"
                     and span.attributes.get("osd.source") == primary_osd_id
                 ):
                     self.logger.debug(
-                        f"Linking to closed primary session span {span.span_id}"
+                        f"Linking to closed primary NewChunk span {span.span_id}"
                     )
                     return span.span_id, span.trace_id
 
