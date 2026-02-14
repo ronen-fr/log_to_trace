@@ -337,6 +337,11 @@ class TraceBuilder:
         if self.fixed:
             self.logger.debug("Fixed ID mode enabled: generating sequential IDs starting at 1")
 
+        # Session success tracking per (pg_id, source_osd):
+        #   'reached_active_scrubbing': bool - whether ActiveScrubbing was reached
+        #   'abort_reason': Optional[str] - abort cause if on_mid_scrub_abort was seen
+        self._session_info: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
     def get_trace_id(self, pg_id: str) -> str:
         """Get or create a trace ID for a PG ID."""
         if pg_id not in self.trace_ids:
@@ -484,6 +489,14 @@ class TraceBuilder:
             self.last_primary_span_id[pg_id] = span.span_id
             self.logger.debug(f"Recorded primary span {span.span_id} as last_primary for PG {pg_id}")
 
+        # Initialize session tracking when a Session span is created
+        if state == self._SESSION_STATE:
+            key = (pg_id, source_osd)
+            self._session_info[key] = {
+                'reached_active_scrubbing': False,
+                'abort_reason': None,
+            }
+
         return span
 
     def close_span(self, span: Span, end_time_iso: Optional[str] = None):
@@ -506,6 +519,26 @@ class TraceBuilder:
             span.attributes['end_time_iso'] = span.attributes.get('start_time_iso', '')
 
         self.logger.debug(f"Closed span {span.span_id} name={span.name} end_ns={span.end_time_ns}")
+
+        # When closing a Session span, determine success/failure
+        if span.state_name == self._SESSION_STATE:
+            pg_id = span.attributes.get('pg.id')
+            osd_source_num = span.attributes.get('osd.source', '')
+            source_osd = f"osd.{osd_source_num}"
+            info_key = (pg_id, source_osd)
+            info = self._session_info.pop(info_key, {})
+            abort_reason = info.get('abort_reason')
+            reached = info.get('reached_active_scrubbing', False)
+
+            if abort_reason:
+                span.attributes['successful'] = 'false'
+                span.attributes['failure_reason'] = abort_reason
+            elif not reached:
+                span.attributes['successful'] = 'false'
+                span.attributes['failure_reason'] = 'reserving replicas not completed'
+            else:
+                span.attributes['successful'] = 'true'
+
         # If this is a primary span that gets closed, update last_primary_span_id to the closed span
         if span.attributes.get('role') == 'primary':
             self.last_primary_span_id[span.attributes.get('pg.id')] = span.span_id
@@ -631,6 +664,25 @@ class TraceBuilder:
             stack.append(SpanStackEntry(state_name=intermediate_state, span=span))
             parent_span_id = span.span_id
 
+    # Session abort detection pattern
+    _SESSION_STATE = "PrimaryActive/Session"
+    _ACTIVE_SCRUBBING_PREFIX = "PrimaryActive/Session/ActiveScrubbing"
+    _RE_ABORT_CAUSE = re.compile(r'on_mid_scrub_abort:.*Abort cause:\s*(.*?)\s*$')
+
+    def _check_session_abort(self, key: Tuple[str, str], raw_line: str):
+        """Check if a log line indicates a mid-scrub abort and record the cause."""
+        if 'on_mid_scrub_abort' not in raw_line:
+            return
+        info = self._session_info.get(key)
+        if info is None:
+            return
+        m = self._RE_ABORT_CAUSE.search(raw_line)
+        if m:
+            info['abort_reason'] = m.group(1)
+        elif info.get('abort_reason') is None:
+            # Only set 'unknown' if no reason was previously captured
+            info['abort_reason'] = 'unknown'
+
     # WaitReplicas enrichment patterns
     _WAIT_REPLICAS_STATE = "PrimaryActive/Session/ActiveScrubbing/in-chunk/WaitReplicas"
     _RE_REPLICA_ITEMS = re.compile(r'merge_to_authoritative_set: replica (\d+) has (\d+) items')
@@ -722,10 +774,11 @@ class TraceBuilder:
         stack = self._ensure_stack(key)
         s_old = stack[-1].state_name if stack else None
 
-        # Case 1: Same state - no-op (but still enrich WaitReplicas)
+        # Case 1: Same state - no-op (but still enrich WaitReplicas and detect aborts)
         if s_old and s_new == s_old:
             if s_new == self._WAIT_REPLICAS_STATE:
                 self._enrich_wait_replicas_span(key, raw_line, source_osd)
+            self._check_session_abort(key, raw_line)
             self.prev_states[key] = s_new
             return
 
@@ -741,6 +794,15 @@ class TraceBuilder:
         # Enrich WaitReplicas span with data from the line that triggered the transition
         if s_new == self._WAIT_REPLICAS_STATE:
             self._enrich_wait_replicas_span(key, raw_line, source_osd)
+
+        # Track whether this session has reached ActiveScrubbing
+        if s_new.startswith(self._ACTIVE_SCRUBBING_PREFIX):
+            info = self._session_info.get(key)
+            if info is not None:
+                info['reached_active_scrubbing'] = True
+
+        # Detect on_mid_scrub_abort in the current line
+        self._check_session_abort(key, raw_line)
 
 
 
