@@ -278,6 +278,7 @@ class LogParser:
             'source_osd': source_osd,
             'act_set': act_set,
             'orig_ts': orig_ts,
+            'raw_line': line,
         }
 
 
@@ -630,6 +631,69 @@ class TraceBuilder:
             stack.append(SpanStackEntry(state_name=intermediate_state, span=span))
             parent_span_id = span.span_id
 
+    # WaitReplicas enrichment patterns
+    _WAIT_REPLICAS_STATE = "PrimaryActive/Session/ActiveScrubbing/in-chunk/WaitReplicas"
+    _RE_REPLICA_ITEMS = re.compile(r'merge_to_authoritative_set: replica (\d+) has (\d+) items')
+    _RE_AUTH_SET_COUNT = re.compile(r'compare_smaps: authoritative-set #: (\d+)')
+    _RE_REPLICA_EPOCH = re.compile(r'merge_to_authoritative_set: replica (\d+) has epoch (\d+)')
+    _RE_DECODE_MAP = re.compile(r"decode_received_map: decoded map from : (\d+): versions: (\d+)'(\d+) / (\d+)")
+    _RE_PG_VERSION_LIS = re.compile(r" v (\d+)'(\d+) .* local-lis/les=(\d+)/")
+
+    def _enrich_wait_replicas_span(self, key: Tuple[str, str], raw_line: str, source_osd: str):
+        """Extract objects_count and e_v_i data from WaitReplicas log lines
+        and accumulate them as attributes on the active WaitReplicas span."""
+        stack = self.span_stacks.get(key)
+        if not stack:
+            return
+
+        # Find the WaitReplicas span on the stack
+        wr_span = None
+        for entry in reversed(stack):
+            if entry.state_name == self._WAIT_REPLICAS_STATE:
+                wr_span = entry.span
+                break
+        if not wr_span:
+            return
+
+        # Initialize accumulation dicts if not present
+        if 'objects_count' not in wr_span.attributes:
+            wr_span.attributes['objects_count'] = {}
+        if 'e_v_i' not in wr_span.attributes:
+            wr_span.attributes['e_v_i'] = {}
+
+        objects_count = wr_span.attributes['objects_count']
+        e_v_i = wr_span.attributes['e_v_i']
+        primary_osd_num = source_osd.split('.')[1]
+
+        # Pattern: merge_to_authoritative_set: replica {OSD} has {N} items
+        m = self._RE_REPLICA_ITEMS.search(raw_line)
+        if m:
+            objects_count[m.group(1)] = int(m.group(2))
+
+        # Pattern: compare_smaps: authoritative-set #: {N}  (primary's object count)
+        m = self._RE_AUTH_SET_COUNT.search(raw_line)
+        if m:
+            objects_count[primary_osd_num] = int(m.group(1))
+            # Also extract primary's e_v_i from the PG descriptor in the same line
+            mv = self._RE_PG_VERSION_LIS.search(raw_line)
+            if mv:
+                e_v_i[primary_osd_num] = [int(mv.group(1)), int(mv.group(2)), int(mv.group(3))]
+
+        # Pattern: merge_to_authoritative_set: replica {OSD} has epoch {E}
+        m = self._RE_REPLICA_EPOCH.search(raw_line)
+        if m:
+            osd_num = m.group(1)
+            epoch = int(m.group(2))
+            if osd_num in e_v_i:
+                e_v_i[osd_num][0] = epoch
+            else:
+                e_v_i[osd_num] = [epoch, 0, 0]
+
+        # Pattern: decode_received_map: decoded map from : {N}: versions: {EP}'{VER} / {IV}
+        m = self._RE_DECODE_MAP.search(raw_line)
+        if m:
+            e_v_i[m.group(1)] = [int(m.group(2)), int(m.group(3)), int(m.group(4))]
+
     def process_entry(self, data: Dict[str, Any]):
         """Process a parsed log entry."""
         pg_id = data['pg_id']
@@ -637,7 +701,7 @@ class TraceBuilder:
         source_osd = data['source_osd']
         act_set = data['act_set']
         line_ts = data.get('orig_ts')
-        # the_session = s_new == "PrimaryActive/Session"
+        raw_line = data.get('raw_line', '')
 
         # Update context
         self._update_context(pg_id, act_set, line_ts)
@@ -658,8 +722,10 @@ class TraceBuilder:
         stack = self._ensure_stack(key)
         s_old = stack[-1].state_name if stack else None
 
-        # Case 1: Same state - no-op
+        # Case 1: Same state - no-op (but still enrich WaitReplicas)
         if s_old and s_new == s_old:
+            if s_new == self._WAIT_REPLICAS_STATE:
+                self._enrich_wait_replicas_span(key, raw_line, source_osd)
             self.prev_states[key] = s_new
             return
 
@@ -671,6 +737,10 @@ class TraceBuilder:
             self._handle_divergent_transition(stack, s_new, pg_id, source_osd, act_set, line_ts)
 
         self.prev_states[key] = s_new
+
+        # Enrich WaitReplicas span with data from the line that triggered the transition
+        if s_new == self._WAIT_REPLICAS_STATE:
+            self._enrich_wait_replicas_span(key, raw_line, source_osd)
 
 
 
@@ -724,7 +794,8 @@ class TraceBuilder:
                     "startTime": span.start_time_ns // 1000,  # Convert to microseconds
                     "duration": ((span.end_time_ns or span.start_time_ns) - span.start_time_ns) // 1000,
                     "tags": [
-                        {"key": k, "type": "string", "value": str(v)}
+                        {"key": k, "type": "string",
+                         "value": json.dumps(v) if isinstance(v, dict) else str(v)}
                         for k, v in span.attributes.items()
                         if k != 'opentracing.ref_type' and k != 'opentracing.follows_from'
                     ],
