@@ -16,8 +16,14 @@ import subprocess
 import datetime
 import tempfile
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Set
 from dataclasses import dataclass, field
+
+# dateutil used for flexible parsing of --start/--end arguments
+try:
+    from dateutil import parser as _dateutil_parser
+except Exception:  # pragma: no cover - environment issue
+    _dateutil_parser = None
 
 
 class ReferenceType(str, Enum):
@@ -897,12 +903,33 @@ class Arguments:
     output_file: Optional[str]
     debug: bool
     fixed: bool = False
+    # Optional PG ID filter (normalized pg ids, e.g. '2.2')
+    pg_ids: Optional[Set[str]] = None
+    # Optional start/end timestamps in nanoseconds since epoch
+    start_ns: Optional[int] = None
+    end_ns: Optional[int] = None
+
+
+def _parse_dt_to_ns(s: str) -> int:
+    """Parse a datetime string using dateutil and return nanoseconds since epoch.
+
+    Raises ValueError if parsing fails or dateutil is unavailable.
+    """
+    if _dateutil_parser is None:
+        raise ValueError("dateutil is required for parsing --start/--end values")
+    dt = _dateutil_parser.parse(s)
+    # Ensure timezone-aware => convert to UTC timestamp
+    if dt.tzinfo is None:
+        # treat naive times as UTC
+        import datetime as _dt
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    return int(dt.timestamp() * 1e9)
 
 
 def parse_arguments() -> Arguments:
     """Parse command line arguments."""
     if len(sys.argv) < 2:
-        print("Usage: python3 log_to_trace.py <input-log-file>... [--out=output.json] [--debug] [--fixed]", file=sys.stderr)
+        print("Usage: python3 log_to_trace.py <input-log-file>... [--out=output.json] [--debug] [--fixed] [--pg=1.1,2.2] [--start=TS] [--end=TS]", file=sys.stderr)
         sys.exit(1)
 
     args = sys.argv[1:]
@@ -910,6 +937,9 @@ def parse_arguments() -> Arguments:
     output_file: Optional[str] = None
     debug = False
     fixed = False
+    pg_ids: Optional[Set[str]] = None
+    start_ns: Optional[int] = None
+    end_ns: Optional[int] = None
 
     i = 0
     while i < len(args):
@@ -929,12 +959,58 @@ def parse_arguments() -> Arguments:
             fixed = val in ('1', 'true', 'yes', 'y')
         elif a == '--fixed':
             fixed = True
+        elif a.startswith('--pg='):
+            val = a.split('=', 1)[1]
+            # split, normalize and store
+            pg_ids = {normalize_pg_id(x.strip()) for x in val.split(',') if x.strip()}
+        elif a == '--pg':
+            if i + 1 >= len(args):
+                print("Error: --pg requires a comma-separated list of PG IDs", file=sys.stderr)
+                sys.exit(1)
+            pg_ids = {normalize_pg_id(x.strip()) for x in args[i + 1].split(',') if x.strip()}
+            i += 1
+        elif a.startswith('--start='):
+            val = a.split('=', 1)[1]
+            try:
+                start_ns = _parse_dt_to_ns(val)
+            except Exception as e:
+                print(f"Error: cannot parse --start value '{val}': {e}", file=sys.stderr)
+                sys.exit(1)
+        elif a == '--start':
+            if i + 1 >= len(args):
+                print("Error: --start requires a timestamp", file=sys.stderr)
+                sys.exit(1)
+            val = args[i + 1]
+            try:
+                start_ns = _parse_dt_to_ns(val)
+            except Exception as e:
+                print(f"Error: cannot parse --start value '{val}': {e}", file=sys.stderr)
+                sys.exit(1)
+            i += 1
+        elif a.startswith('--end='):
+            val = a.split('=', 1)[1]
+            try:
+                end_ns = _parse_dt_to_ns(val)
+            except Exception as e:
+                print(f"Error: cannot parse --end value '{val}': {e}", file=sys.stderr)
+                sys.exit(1)
+        elif a == '--end':
+            if i + 1 >= len(args):
+                print("Error: --end requires a timestamp", file=sys.stderr)
+                sys.exit(1)
+            val = args[i + 1]
+            try:
+                end_ns = _parse_dt_to_ns(val)
+            except Exception as e:
+                print(f"Error: cannot parse --end value '{val}': {e}", file=sys.stderr)
+                sys.exit(1)
+            i += 1
         else:
             input_files.append(a)
         i += 1
 
     if not input_files:
-        print("Usage: python3 log_to_trace.py <input-log-file>... [--out=output.json] [--debug] [--fixed]", file=sys.stderr)
+        print("Usage: python3 log_to_trace.py <input-log-file>... [--out=output.json] [--debug] [--fixed] [--pg=1.1,2.2] [--start=TS] [--end=TS]", file=sys.stderr)
         sys.exit(1)
 
     # If an --out was specified and doesn't end with .json, append .json
@@ -948,8 +1024,7 @@ def parse_arguments() -> Arguments:
         tmpf.close()
         print(f"No --out specified. Writing traces to temporary file {output_file}", file=sys.stderr)
 
-    return Arguments(input_files=input_files, output_file=output_file, debug=debug, fixed=fixed)
-
+    return Arguments(input_files=input_files, output_file=output_file, debug=debug, fixed=fixed, pg_ids=pg_ids, start_ns=start_ns, end_ns=end_ns)
 
 def prepare_input_files(input_files: List[str]) -> List[str]:
     """Prepare and filter input files to temp files.
@@ -977,8 +1052,15 @@ def prepare_input_files(input_files: List[str]) -> List[str]:
     return tmp_files
 
 
-def process_sorted_logs(tmp_files: List[str], parser: LogParser, builder: TraceBuilder):
-    """Process sorted log lines through parser and builder."""
+def process_sorted_logs(tmp_files: List[str], parser: LogParser, builder: TraceBuilder,
+                        pg_ids: Optional[Set[str]] = None,
+                        start_ns: Optional[int] = None,
+                        end_ns: Optional[int] = None):
+    """Process sorted log lines through parser and builder with optional filters.
+
+    - pg_ids: only process lines whose parsed pg_id is in this set
+    - start_ns / end_ns: filter by line timestamp (nanoseconds since epoch)
+    """
     sort_cmd = ["sort", "-m", "--stable"] + tmp_files
     env = os.environ.copy()
     env["LC_ALL"] = "C"
@@ -990,8 +1072,26 @@ def process_sorted_logs(tmp_files: List[str], parser: LogParser, builder: TraceB
             if not line:
                 continue
             data = parser.parse_line(line)
-            if data:
-                builder.process_entry(data)
+            if not data:
+                continue
+
+            # PG filter
+            if pg_ids is not None and data.get('pg_id') not in pg_ids:
+                continue
+
+            # Time range filter: parse line timestamp to ns and compare
+            if start_ns is not None or end_ns is not None:
+                line_ts = data.get('orig_ts')
+                line_ns = parse_iso_to_ns(line_ts) if line_ts else None
+                # If we don't have a parseable timestamp, skip the line when time filtering is active
+                if line_ns is None:
+                    continue
+                if start_ns is not None and line_ns < start_ns:
+                    continue
+                if end_ns is not None and line_ns > end_ns:
+                    continue
+
+            builder.process_entry(data)
     finally:
         if p_sort.stdout:
             p_sort.stdout.close()
@@ -1034,7 +1134,7 @@ def main():
     # Parse and build traces
     parser = LogParser()
     builder = TraceBuilder(debug=args.debug, fixed=args.fixed)
-    process_sorted_logs(tmp_files, parser, builder)
+    process_sorted_logs(tmp_files, parser, builder, pg_ids=args.pg_ids, start_ns=args.start_ns, end_ns=args.end_ns)
 
     # Output results
     write_output(builder, args.output_file)
