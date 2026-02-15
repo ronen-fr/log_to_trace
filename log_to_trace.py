@@ -308,7 +308,9 @@ class TraceBuilder:
     - Replica spans (ReplicaActive/ReplicaActiveOp) link to the latest primary NewChunk span via FOLLOWS_FROM
     """
 
-    def __init__(self, debug: bool = False, fixed: bool = False):
+    def __init__(self, debug: bool = False, fixed: bool = False,
+                 objects: bool = False, objects_hash_salt: Optional[str] = None,
+                 unsecure_objects: bool = False):
         # trace_id per normalized PG ID
         self.trace_ids: Dict[str, str] = {}
         # Last seen act-set per normalized PG ID
@@ -342,6 +344,14 @@ class TraceBuilder:
         self._fixed_span_counter = 0
         if self.fixed:
             self.logger.debug("Fixed ID mode enabled: generating sequential IDs starting at 1")
+
+        # Objects extraction configuration
+        self.objects_enabled = objects
+        self.objects_hash_salt = objects_hash_salt
+        self.unsecure_objects = unsecure_objects
+        if self.unsecure_objects and self.objects_hash_salt:
+            self.logger.error("--unsecure-objects cannot be used together with --objects-hash-salt")
+            raise ValueError("--unsecure-objects cannot be used together with --objects-hash-salt")
 
         # Session success tracking per (pg_id, source_osd):
         #   'reached_active_scrubbing': bool - whether ActiveScrubbing was reached
@@ -697,30 +707,48 @@ class TraceBuilder:
     _RE_DECODE_MAP = re.compile(r"decode_received_map: decoded map from : (\d+): versions: (\d+)'(\d+) / (\d+)")
     _RE_PG_VERSION_LIS = re.compile(r" v (\d+)'(\d+) .* local-lis/les=(\d+)/")
 
+    # Object extraction (select_auth_object) patterns
+    _RE_SELECT_AUTH_OBJ_GOT = re.compile(r'select_auth_object:\s+([^\s]+)\s+shard\s+\d+\s+got:')
+    _RE_SELECT_AUTH_OBJ_SELECTING = re.compile(r'select_auth_object:\s+selecting osd \d+ for obj\s+([^\s]+)\s+with')
+
+    def _hash_object_name(self, name: str) -> str:
+        import hashlib
+        salt = self.objects_hash_salt or ''
+        return hashlib.sha256((salt + name).encode('utf-8')).hexdigest()
+
     def _enrich_wait_replicas_span(self, key: Tuple[str, str], raw_line: str, source_osd: str):
-        """Extract objects_count and e_v_i data from WaitReplicas log lines
-        and accumulate them as attributes on the active WaitReplicas span."""
+        """Extract objects_count, e_v_i and (optionally) 'objects' from WaitReplicas log lines
+        and accumulate them as attributes on the active WaitReplicas (in-chunk) span."""
         stack = self.span_stacks.get(key)
         if not stack:
             return
 
         # Find the WaitReplicas span on the stack
-        wr_span = None
+        wr_entry = None
         for entry in reversed(stack):
             if entry.state_name == self._WAIT_REPLICAS_STATE:
-                wr_span = entry.span
+                wr_entry = entry
                 break
-        if not wr_span:
+        if not wr_entry:
             return
 
-        # Initialize accumulation dicts if not present
-        if 'objects_count' not in wr_span.attributes:
-            wr_span.attributes['objects_count'] = {}
-        if 'e_v_i' not in wr_span.attributes:
-            wr_span.attributes['e_v_i'] = {}
+        # Prefer adding attributes to the enclosing 'in-chunk' span; fall back to WaitReplicas
+        in_chunk_entry = None
+        for entry in reversed(stack):
+            if entry.state_name == 'PrimaryActive/Session/ActiveScrubbing/in-chunk':
+                in_chunk_entry = entry
+                break
 
-        objects_count = wr_span.attributes['objects_count']
-        e_v_i = wr_span.attributes['e_v_i']
+        target_span = in_chunk_entry.span if in_chunk_entry is not None else wr_entry.span
+
+        # Initialize accumulation dicts if not present on the target span
+        if 'objects_count' not in target_span.attributes:
+            target_span.attributes['objects_count'] = {}
+        if 'e_v_i' not in target_span.attributes:
+            target_span.attributes['e_v_i'] = {}
+
+        objects_count = target_span.attributes['objects_count']
+        e_v_i = target_span.attributes['e_v_i']
         primary_osd_num = source_osd.split('.')[1]
 
         # Pattern: merge_to_authoritative_set: replica {OSD} has {N} items
@@ -751,6 +779,26 @@ class TraceBuilder:
         m = self._RE_DECODE_MAP.search(raw_line)
         if m:
             e_v_i[m.group(1)] = [int(m.group(2)), int(m.group(3)), int(m.group(4))]
+
+        # Optional: extract object names from select_auth_object lines and attach to 'objects' attribute
+        if getattr(self, 'objects_enabled', False):
+            if 'objects' not in target_span.attributes:
+                target_span.attributes['objects'] = set()
+
+            obj_name = None
+            m = self._RE_SELECT_AUTH_OBJ_GOT.search(raw_line)
+            if m:
+                obj_name = m.group(1)
+            else:
+                m = self._RE_SELECT_AUTH_OBJ_SELECTING.search(raw_line)
+                if m:
+                    obj_name = m.group(1)
+
+            if obj_name:
+                if getattr(self, 'unsecure_objects', False):
+                    target_span.attributes['objects'].add(obj_name)
+                else:
+                    target_span.attributes['objects'].add(self._hash_object_name(obj_name))
 
     def process_entry(self, data: Dict[str, Any]):
         """Process a parsed log entry."""
@@ -863,7 +911,11 @@ class TraceBuilder:
                     "duration": ((span.end_time_ns or span.start_time_ns) - span.start_time_ns) // 1000,
                     "tags": [
                         {"key": k, "type": "string",
-                         "value": json.dumps(v) if isinstance(v, dict) else str(v)}
+                         "value": (
+                             json.dumps(sorted(list(v))) if isinstance(v, set)
+                             else json.dumps(v) if isinstance(v, (dict, list, tuple))
+                             else str(v)
+                         )}
                         for k, v in span.attributes.items()
                         if k != 'opentracing.ref_type' and k != 'opentracing.follows_from'
                     ],
@@ -908,6 +960,10 @@ class Arguments:
     # Optional start/end timestamps in nanoseconds since epoch
     start_ns: Optional[int] = None
     end_ns: Optional[int] = None
+    # Optional objects extraction flags
+    objects: bool = False
+    objects_hash_salt: Optional[str] = None
+    unsecure_objects: bool = False
 
 
 def _parse_dt_to_ns(s: str) -> int:
@@ -940,6 +996,9 @@ def parse_arguments() -> Arguments:
     pg_ids: Optional[Set[str]] = None
     start_ns: Optional[int] = None
     end_ns: Optional[int] = None
+    objects_flag = False
+    objects_hash_salt: Optional[str] = None
+    unsecure_objects = False
 
     i = 0
     while i < len(args):
@@ -1005,9 +1064,33 @@ def parse_arguments() -> Arguments:
                 print(f"Error: cannot parse --end value '{val}': {e}", file=sys.stderr)
                 sys.exit(1)
             i += 1
+        elif a == '--objects':
+            objects_flag = True
+        elif a.startswith('--objects='):
+            val = a.split('=', 1)[1].lower()
+            objects_flag = val in ('1', 'true', 'yes', 'y')
+        elif a.startswith('--objects-hash-salt='):
+            objects_hash_salt = a.split('=', 1)[1]
+        elif a == '--objects-hash-salt':
+            if i + 1 >= len(args):
+                print("Error: --objects-hash-salt requires a salt string", file=sys.stderr)
+                sys.exit(1)
+            objects_hash_salt = args[i + 1]
+            i += 1
+        elif a == '--unsecure-objects':
+            unsecure_objects = True
+        elif a.startswith('--unsecure-objects='):
+            val = a.split('=', 1)[1].lower()
+            unsecure_objects = val in ('1', 'true', 'yes', 'y')
         else:
             input_files.append(a)
         i += 1
+
+    # Validate --unsecure-objects vs --objects-hash-salt
+    if unsecure_objects and objects_hash_salt:
+        print("Error: --unsecure-objects cannot be used together with --objects-hash-salt", file=sys.stderr)
+        sys.exit(1)
+
 
     if not input_files:
         print("Usage: python3 log_to_trace.py <input-log-file>... [--out=output.json] [--debug] [--fixed] [--pg=1.1,2.2] [--start=TS] [--end=TS]", file=sys.stderr)
@@ -1024,7 +1107,7 @@ def parse_arguments() -> Arguments:
         tmpf.close()
         print(f"No --out specified. Writing traces to temporary file {output_file}", file=sys.stderr)
 
-    return Arguments(input_files=input_files, output_file=output_file, debug=debug, fixed=fixed, pg_ids=pg_ids, start_ns=start_ns, end_ns=end_ns)
+    return Arguments(input_files=input_files, output_file=output_file, debug=debug, fixed=fixed, pg_ids=pg_ids, start_ns=start_ns, end_ns=end_ns, objects=objects_flag, objects_hash_salt=objects_hash_salt, unsecure_objects=unsecure_objects)
 
 def prepare_input_files(input_files: List[str]) -> List[str]:
     """Prepare and filter input files to temp files.
@@ -1133,7 +1216,10 @@ def main():
 
     # Parse and build traces
     parser = LogParser()
-    builder = TraceBuilder(debug=args.debug, fixed=args.fixed)
+    builder = TraceBuilder(debug=args.debug, fixed=args.fixed,
+                           objects=args.objects,
+                           objects_hash_salt=args.objects_hash_salt,
+                           unsecure_objects=args.unsecure_objects)
     process_sorted_logs(tmp_files, parser, builder, pg_ids=args.pg_ids, start_ns=args.start_ns, end_ns=args.end_ns)
 
     # Output results

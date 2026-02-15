@@ -56,3 +56,16 @@ def test_parse_start_invalid_exits():
             pass
     finally:
         sys.argv = old
+
+
+def test_objects_unsecure_and_salt_conflict():
+    old = sys.argv
+    try:
+        sys.argv = ['log_to_trace.py', '--objects', '--unsecure-objects', '--objects-hash-salt=abc', 'input.log']
+        try:
+            parse_arguments()
+            assert False, 'parse_arguments should have exited due to conflicting options'
+        except SystemExit:
+            pass
+    finally:
+        sys.argv = old
