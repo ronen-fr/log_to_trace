@@ -4,5 +4,7 @@
         ],
     "workbench.colorCustomizations": {
         "editorBracketMatch.foreground": "#ff0000"
-    }
+},
+"python-envs.defaultEnvManager": "ms-python.python:system",
+"python-envs.pythonProjects": []
 }

@@ -69,3 +69,57 @@ def test_objects_unsecure_and_salt_conflict():
             pass
     finally:
         sys.argv = old
+
+
+def test_help_printed_for_no_args(capsys):
+    old = sys.argv
+    try:
+        sys.argv = ['log_to_trace.py']
+        try:
+            parse_arguments()
+            assert False, 'parse_arguments should have exited when no args (help)'
+        except SystemExit as e:
+            assert e.code == 0
+            captured = capsys.readouterr()
+            assert 'Usage:' in captured.out
+            assert '--out' in captured.out
+            assert '--start' in captured.out
+            # defaults described
+            assert 'temporary file' in captured.out
+            assert '/tmp' in captured.out
+            assert 'no start-time filter' in captured.out
+            assert 'no end-time filter' in captured.out
+    finally:
+        sys.argv = old
+
+
+def test_help_printed_for_short_flag(capsys):
+    old = sys.argv
+    try:
+        sys.argv = ['log_to_trace.py', '-h']
+        try:
+            parse_arguments()
+            assert False, 'parse_arguments should have exited on -h'
+        except SystemExit as e:
+            assert e.code == 0
+            captured = capsys.readouterr()
+            assert 'Usage:' in captured.out
+            assert '--help' in captured.out or '-h' in captured.out
+    finally:
+        sys.argv = old
+
+
+def test_help_printed_for_long_flag(capsys):
+    old = sys.argv
+    try:
+        sys.argv = ['log_to_trace.py', '--help']
+        try:
+            parse_arguments()
+            assert False, 'parse_arguments should have exited on --help'
+        except SystemExit as e:
+            assert e.code == 0
+            captured = capsys.readouterr()
+            assert 'Usage:' in captured.out
+            assert '--objects' in captured.out
+    finally:
+        sys.argv = old

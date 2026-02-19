@@ -983,10 +983,47 @@ def _parse_dt_to_ns(s: str) -> int:
 
 
 def parse_arguments() -> Arguments:
-    """Parse command line arguments."""
-    if len(sys.argv) < 2:
-        print("Usage: python3 log_to_trace.py <input-log-file>... [--out=output.json] [--debug] [--fixed] [--pg=1.1,2.2] [--start=TS] [--end=TS]", file=sys.stderr)
-        sys.exit(1)
+    """Parse command line arguments.
+
+    If called with no arguments or with -h/--help, print a detailed usage
+    message describing all supported parameters and exit.
+    """
+    # Print detailed help when run with no args or explicit help flag
+    if len(sys.argv) < 2 or any(a in ('-h', '--help') for a in sys.argv[1:]):
+        help_text = (
+            "Usage: python3 log_to_trace.py [OPTIONS] <input-log-file>...\n"
+            "\n"
+            "Convert scrubber debug log(s) into Jaeger-compatible OpenTelemetry JSON.\n"
+            "\n"
+            "Options:\n"
+            "  -h, --help                     Show this help message and exit.\n"
+            "  -d, --debug                    Enable debug logging (verbose).\n"
+            "  --out=FILE, --out FILE         Write output to FILE (adds .json if missing).\n"
+            "                                 Default: if omitted a temporary file will be\n"
+            "                                 created under /tmp and its path will be\n"
+            "                                 printed to stderr.\n"
+            "  --fixed                        Use deterministic sequential trace/span IDs.\n"
+            "  --pg=PG[,PG...]                Only include these PG IDs (normalize e.g. '2.2').\n"
+            "  --start=TIMESTAMP              Start time filter (dateutil formats accepted).\n"
+            "                                 Default: no start-time filter (process from the\n"
+            "                                 beginning).\n"
+            "  --end=TIMESTAMP                End time filter.\n"
+            "                                 Default: no end-time filter (process to the\n"
+            "                                 end).\n"
+            "  --objects[=BOOL]               Extract object names (default: false).\n"
+            "  --objects-hash-salt=STRING     Salt used to hash object names (mutually exclusive\n"
+            "                                 with --unsecure-objects).\n"
+            "  --unsecure-objects[=BOOL]      Include raw object names (insecure).\n"
+            "\n"
+            "Examples:\n"
+            "  python3 log_to_trace.py runs/osd.0.log.debug runs/osd.1.log.debug \\n"
+            "      --out=out.json --pg=2.2 --start=2026-01-01\n"
+            "\n"
+            "Notes:\n"
+            "  - Input files may be compressed (.gz); they will be zcat'ed.\n"
+        )
+        print(help_text)
+        raise SystemExit(0)
 
     args = sys.argv[1:]
     input_files: List[str] = []
